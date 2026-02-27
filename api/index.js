@@ -6,8 +6,13 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
+// Custom Headers to prevent getting blocked
+const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
+
+// Clean text for perfect matching
 const clean = (s) => (s || "").toLowerCase().replace(/[^\w\s]|_/g, "").replace(/\s+/g, " ").trim();
 
+// EXACT MATCHING LOGIC FROM YOUR yyyyyy.html
 function performMatching(apiData, targetTrack, targetArtist, isJioSaavn = false) {
     if (!apiData || apiData.length === 0) return null;
     const tTitle = clean(targetTrack);
@@ -27,7 +32,7 @@ function performMatching(apiData, targetTrack, targetArtist, isJioSaavn = false)
                 rArtists = track.primary_artists.split(',').map(clean);
             }
         } else {
-            rArtists = [clean(track.artistName)];
+            rArtists =[clean(track.artistName)];
         }
 
         let score = 0;
@@ -40,7 +45,7 @@ function performMatching(apiData, targetTrack, targetArtist, isJioSaavn = false)
             }
             if (!artistMatched) score = 0;
         } else {
-            score += 50;
+            score += 50; // Boost if no artist provided
         }
 
         if (score > 0) {
@@ -57,65 +62,88 @@ function performMatching(apiData, targetTrack, targetArtist, isJioSaavn = false)
     return highestScore > 0 ? bestMatch : null;
 }
 
+// 1. GET SPOTIFY URL USING OFFICIAL FREE API (100% Reliable)
 async function getSpotifyUrl(adamId) {
     if (!adamId) return null;
     try {
-        const { data } = await axios.get(`https://song.link/i/${adamId}`);
-        const $ = cheerio.load(data);
-        const nextData = JSON.parse($('#__NEXT_DATA__').html());
-        const sections = nextData.props?.pageProps?.pageData?.sections ||[];
-        for (let section of sections) {
-            if (section.links) {
-                const spotifyLink = section.links.find(l => l.platform === 'spotify');
-                if (spotifyLink) return spotifyLink.url;
-            }
+        const { data } = await axios.get(`https://api.song.link/v1-alpha.1/links?itunesId=${adamId}`, { headers });
+        if (data && data.linksByPlatform && data.linksByPlatform.spotify) {
+            return data.linksByPlatform.spotify.url;
         }
-    } catch (e) { }
+    } catch (e) {
+        console.error("Song.link API Error:", e.message);
+    }
     return null;
 }
 
+// 2. SCRAPE APPLE MUSIC HTML FOR RECOMMENDATIONS DEEPLY
 async function getAppleMusicData(url) {
     try {
-        const { data } = await axios.get(url);
+        const { data } = await axios.get(url, { headers });
         const $ = cheerio.load(data);
-        const jsonData = JSON.parse($('#serialized-server-data').html());
-        let moreFromArtist =[];
-        let recommendations = [];
+        const jsonText = $('#serialized-server-data').text() || $('#serialized-server-data').html();
+        if (!jsonText) return { moreFromArtist: [], recommendations:[] };
 
-        const sections = jsonData[0]?.data?.sections ||[];
+        const jsonData = JSON.parse(jsonText);
+        let moreFromArtist = [];
+        let recommendations = [];
+        let sections =[];
+
+        // Deep search to find all sections
+        function findSections(obj) {
+            if (!obj || typeof obj !== 'object') return;
+            if (Array.isArray(obj.sections)) sections = sections.concat(obj.sections);
+            for (let key in obj) {
+                if (typeof obj[key] === 'object') findSections(obj[key]);
+            }
+        }
+        findSections(jsonData);
+
         sections.forEach(sec => {
-            const headerTitle = sec.header?.item?.titleLink?.title || "";
-            if (headerTitle.includes("More by")) {
+            const headerTitle = sec.header?.item?.titleLink?.title || sec.header?.item?.title || "";
+            
+            if (headerTitle.includes("More by") || headerTitle.includes("Top Songs")) {
                 sec.items?.forEach(item => {
-                    moreFromArtist.push({ title: item.titleLinks[0]?.title || "", adamId: item.contentDescriptor?.identifiers?.storeAdamID });
+                    let title = item.titleLinks?.[0]?.title || item.title || "";
+                    let adamId = item.contentDescriptor?.identifiers?.storeAdamID || item.id;
+                    if(title && adamId) moreFromArtist.push({ title, adamId });
                 });
-            } else if (headerTitle.includes("You Might Also Like") || headerTitle.includes("Featured On")) {
+            } 
+            else if (headerTitle.includes("You Might Also Like") || headerTitle.includes("Featured On") || headerTitle.includes("Similar")) {
                 sec.items?.forEach(item => {
-                    recommendations.push({ title: item.titleLinks?.[0]?.title || item.accessibilityLabel || "", adamId: item.contentDescriptor?.identifiers?.storeAdamID });
+                    let title = item.titleLinks?.[0]?.title || item.accessibilityLabel || item.title || "";
+                    let adamId = item.contentDescriptor?.identifiers?.storeAdamID || item.id;
+                    if(title && adamId) recommendations.push({ title, adamId });
                 });
             }
         });
+
         return { moreFromArtist, recommendations };
     } catch (e) {
         return { moreFromArtist: [], recommendations:[] };
     }
 }
 
+// 3. SEARCH JIOSAAVN
 async function getJioSaavnData(title, artist) {
     try {
-        const cleanQuery = title.replace(/\(From.*?\)/gi, '').replace(/- Single/gi, '').trim();
-        const { data } = await axios.get(`https://ayushm-psi.vercel.app/api/search/songs?query=${encodeURIComponent(cleanQuery + " " + artist)}`);
+        // Clean title heavily so JioSaavn doesn't get confused
+        const cleanQuery = title.replace(/\(From.*?\)/gi, '').replace(/\[From.*?\]/gi, '').replace(/\(Original.*?\)/gi, '').replace(/- Single/gi, '').replace(/- EP/gi, '').trim();
+        const { data } = await axios.get(`https://ayushm-psi.vercel.app/api/search/songs?query=${encodeURIComponent(cleanQuery + " " + artist)}`, { headers });
         return performMatching(data?.data?.results ||[], cleanQuery, artist, true);
-    } catch (e) { return null; }
+    } catch (e) { 
+        return null; 
+    }
 }
 
+// 4. MAIN API ENDPOINT
 app.get('/api/search', async (req, res) => {
     const { song, artist } = req.query;
     if (!song || !artist) return res.status(400).json({ error: "Missing 'song' or 'artist' parameters" });
 
     try {
         const itunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(song + " " + artist)}&entity=song&limit=15`;
-        const { data: itunesData } = await axios.get(itunesUrl);
+        const { data: itunesData } = await axios.get(itunesUrl, { headers });
         const matchedTrack = performMatching(itunesData.results, song, artist, false);
         
         if (!matchedTrack) return res.status(404).json({ error: "Song not found on iTunes" });
@@ -123,23 +151,33 @@ app.get('/api/search', async (req, res) => {
         const trackId = matchedTrack.trackId;
         const trackViewUrl = matchedTrack.trackViewUrl;
 
-        const [spotifyUrl, jiosaavnData, appleData] = await Promise.all([
+        // Fetch Current Song Data concurrently
+        const[spotifyUrl, jiosaavnData, appleData] = await Promise.all([
             getSpotifyUrl(trackId),
             getJioSaavnData(song, artist),
             getAppleMusicData(trackViewUrl)
         ]);
 
+        // Helper: Process recommendations and attach Spotify + JioSaavn data
         const processList = async (list) => {
             const processed =[];
-            // Limiting to 3 to keep Vercel from timing out (10s max limit)
-            for (let item of list.slice(0, 3)) { 
-                const trackName = item.title.split(' - ')[0]; 
-                const [itemJioSaavn, itemSpotify] = await Promise.all([
-                    getJioSaavnData(trackName, ""), 
+            // Limit to 4 to prevent Vercel 10s Serverless Timeout
+            for (let item of list.slice(0, 4)) { 
+                const cleanTrackName = item.title.split(' - ')[0].replace(/\(From.*?\)/gi, '').trim();
+                
+                const[itemJioSaavn, itemSpotify] = await Promise.all([
+                    getJioSaavnData(cleanTrackName, ""), // Empty artist forces title-only match
                     getSpotifyUrl(item.adamId)
                 ]);
+
+                // Only append if JioSaavn match is found
                 if (itemJioSaavn) {
-                    processed.push({ title: item.title, apple_id: item.adamId, spotify_url: itemSpotify, jiosaavn_data: itemJioSaavn });
+                    processed.push({ 
+                        title: item.title, 
+                        apple_id: item.adamId, 
+                        spotify_url: itemSpotify, 
+                        jiosaavn_data: itemJioSaavn 
+                    });
                 }
             }
             return processed;
@@ -150,12 +188,19 @@ app.get('/api/search', async (req, res) => {
 
         res.json({
             success: true,
-            current_song: { title: matchedTrack.trackName, artist: matchedTrack.artistName, apple_id: trackId, spotify_url: spotifyUrl, jiosaavn_data: jiosaavnData },
+            current_song: { 
+                title: matchedTrack.trackName, 
+                artist: matchedTrack.artistName, 
+                apple_id: trackId, 
+                spotify_url: spotifyUrl, 
+                jiosaavn_data: jiosaavnData 
+            },
             more_from_artist,
             recommendations
         });
 
     } catch (error) {
+        console.error(error);
         res.status(500).json({ error: "Internal Server Error" });
     }
 });
